@@ -177,7 +177,12 @@ class StructureData(Dataset):
                     if mag is None:
                         targets["m"] = None
                     else:
-                        targets["m"] = torch.abs(torch.tensor(mag, dtype=TORCH_DTYPE))
+                        if self.absolute_magmom:
+                            targets["m"] = torch.abs(
+                                torch.tensor(mag, dtype=TORCH_DTYPE)
+                            )
+                        else:
+                            targets["m"] = torch.tensor(mag, dtype=TORCH_DTYPE)
 
                 return crystal_graph, targets
 
@@ -286,7 +291,12 @@ class CIFData(Dataset):
                     elif key == "m":
                         mag = self.data[graph_id][self.magmom_key]
                         # use absolute value for magnetic moments
-                        targets["m"] = torch.abs(torch.tensor(mag, dtype=TORCH_DTYPE))
+                        if self.absolute_magmom:
+                            targets["m"] = torch.abs(
+                                torch.tensor(mag, dtype=TORCH_DTYPE)
+                            )
+                        else:
+                            targets["m"] = torch.tensor(mag, dtype=TORCH_DTYPE)
                 return crystal_graph, targets
 
             # Omit structures with isolated atoms.
@@ -325,6 +335,7 @@ class GraphData(Dataset):
         stress_key: str = "stress",
         magmom_key: str = "magmom",
         shuffle: bool = True,
+        absolute_magmom: bool = True,
     ) -> None:
         """Initialize the dataset from a directory containing saved crystal graphs.
 
@@ -370,6 +381,7 @@ class GraphData(Dataset):
         print(f"{len(self.labels)} mp_ids, {len(self)} frames imported")
         if self.excluded_graph is not None:
             print(f"{len(self.excluded_graph)} graphs are pre-excluded")
+        self.absolute_magmom = absolute_magmom
 
         self.energy_key = energy_key
         self.force_key = force_key
@@ -418,9 +430,12 @@ class GraphData(Dataset):
                         if mag is None:
                             targets["m"] = None
                         else:
-                            targets["m"] = torch.abs(
-                                torch.tensor(mag, dtype=TORCH_DTYPE)
-                            )
+                            if self.absolute_magmom:
+                                targets["m"] = torch.abs(
+                                    torch.tensor(mag, dtype=TORCH_DTYPE)
+                                )
+                            else:
+                                targets["m"] = torch.tensor(mag, dtype=TORCH_DTYPE)
                 return crystal_graph, targets
 
             # Omit failed structures. Return another randomly selected structure
@@ -557,6 +572,7 @@ class StructureJsonData(Dataset):
         stress_key: str = "stress",
         magmom_key: str = "magmom",
         shuffle: bool = True,
+        absolute_magmom: bool = True,
     ) -> None:
         """Initialize the dataset by reading JSON files.
 
@@ -606,6 +622,7 @@ class StructureJsonData(Dataset):
         self.targets = targets
         self.failed_idx: list[int] = []
         self.failed_graph_id: dict[str, str] = {}
+        self.absolute_magmom = absolute_magmom
 
     def __len__(self) -> int:
         """Get the number of structures with targets in the dataset."""
@@ -645,9 +662,12 @@ class StructureJsonData(Dataset):
                         if mag is None:
                             targets["m"] = None
                         else:
-                            targets["m"] = torch.abs(
-                                torch.tensor(mag, dtype=TORCH_DTYPE)
-                            )
+                            if self.absolute_magmom:
+                                targets["m"] = torch.abs(
+                                    torch.tensor(mag, dtype=TORCH_DTYPE)
+                                )
+                            else:
+                                targets["m"] = torch.tensor(mag, dtype=TORCH_DTYPE)
                 return crystal_graph, targets
 
             # Omit structures with isolated atoms. Return another randomly selected

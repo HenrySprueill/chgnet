@@ -164,7 +164,7 @@ class CrystalGraph:
         Returns:
             CrystalGraph: The loaded graph.
         """
-        return torch.load(file_name)
+        return torch.load(file_name, weights_only=False)
 
     @classmethod
     def from_dict(cls, dic: dict[str, Any]) -> Self:

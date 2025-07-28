@@ -10,7 +10,7 @@ import torch
 from pymatgen.core import Structure
 from torch import Tensor, nn
 
-from chgnet import PredTask
+from chgnet.__init__ import PredTask
 from chgnet.graph import CrystalGraph, CrystalGraphConverter
 from chgnet.graph.crystalgraph import TORCH_DTYPE
 from chgnet.model.composition_model import AtomRef
@@ -67,6 +67,7 @@ class CHGNet(nn.Module):
         gMLP_norm: str | None = "layer",  # noqa: N803
         readout_norm: str | None = "layer",
         version: str | None = None,
+        absolute_magmom: bool = True,
         **kwargs,
     ) -> None:
         """Initialize CHGNet.
@@ -316,6 +317,7 @@ class CHGNet(nn.Module):
 
         version_str = f" v{version}" if version else ""
         print(f"CHGNet{version_str} initialized with {self.n_params:,} parameters")
+        self.absolute_magmom = absolute_magmom
 
     @property
     def version(self) -> str | None:
@@ -481,10 +483,16 @@ class CHGNet(nn.Module):
                     )
                 # Compute site-wise magnetic moments
                 if compute_magmom:
-                    magmom = torch.abs(self.site_wise(atom_feas))
-                    prediction["m"] = list(
-                        torch.split(magmom.view(-1), atoms_per_graph.tolist())
-                    )
+                    if self.absolute_magmom:
+                        magmom = torch.abs(self.site_wise(atom_feas))
+                        prediction["m"] = list(
+                            torch.split(magmom.view(-1), atoms_per_graph.tolist())
+                        )
+                    else:
+                        magmom = self.site_wise(atom_feas)
+                        prediction["m"] = list(
+                            torch.split(magmom.view(-1), atoms_per_graph.tolist())
+                        )
 
         # Last conv layer
         atom_feas = self.atom_conv_layers[-1](

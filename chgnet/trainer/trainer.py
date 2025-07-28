@@ -64,6 +64,7 @@ class Trainer:
         wandb_path: str | None = None,
         wandb_init_kwargs: dict | None = None,
         extra_run_config: dict | None = None,
+        modified_magmom_loss: str | None = None,
         **kwargs,
     ) -> None:
         """Initialize all hyper-parameters for trainer.
@@ -205,16 +206,42 @@ class Trainer:
             raise NotImplementedError
 
         # Define loss criterion
-        self.criterion = CombinedLoss(
-            target_str=self.targets,
-            criterion=criterion,
-            energy_loss_ratio=energy_loss_ratio,
-            force_loss_ratio=force_loss_ratio,
-            stress_loss_ratio=stress_loss_ratio,
-            mag_loss_ratio=mag_loss_ratio,
-            allow_missing_labels=allow_missing_labels,
-            **kwargs,
-        )
+        if modified_magmom_loss is None:
+            self.criterion = CombinedLoss(
+                target_str=self.targets,
+                criterion=criterion,
+                energy_loss_ratio=energy_loss_ratio,
+                force_loss_ratio=force_loss_ratio,
+                stress_loss_ratio=stress_loss_ratio,
+                mag_loss_ratio=mag_loss_ratio,
+                allow_missing_labels=allow_missing_labels,
+                **kwargs,
+            )
+        elif modified_magmom_loss in ["mul", "subtract"]:
+            self.criterion = ModifiedCombinedCorrelationLoss(
+                target_str=self.targets,
+                criterion=criterion,
+                energy_loss_ratio=energy_loss_ratio,
+                force_loss_ratio=force_loss_ratio,
+                stress_loss_ratio=stress_loss_ratio,
+                mag_loss_ratio=mag_loss_ratio,
+                allow_missing_labels=allow_missing_labels,
+                sign_correlation_method=modified_magmom_loss,
+                **kwargs,
+            )
+        elif modified_magmom_loss == "min":
+            self.criterion = MinCombinedLoss(
+                target_str=self.targets,
+                criterion=criterion,
+                energy_loss_ratio=energy_loss_ratio,
+                force_loss_ratio=force_loss_ratio,
+                stress_loss_ratio=stress_loss_ratio,
+                mag_loss_ratio=mag_loss_ratio,
+                allow_missing_labels=allow_missing_labels,
+                **kwargs,
+            )
+        else:
+            raise ValueError(f"Unknown loss mode {modified_magmom_loss}.")
         self.epochs = epochs
         self.starting_epoch = starting_epoch
 
@@ -227,6 +254,8 @@ class Trainer:
         self.training_history: dict[
             str, dict[Literal["train", "val", "test"], list[float]]
         ] = {key: {"train": [], "val": [], "test": []} for key in self.targets}
+        if modified_magmom_loss:
+            self.training_history["m_sign"] = {"train": [], "val": [], "test": []}
         self.best_model = None
 
         # Initialize wandb if project/run specified
@@ -303,35 +332,26 @@ class Trainer:
             # train
             train_mae = self._train(train_loader, epoch, wandb_log_freq)
             if "e" in train_mae and train_mae["e"] != train_mae["e"]:
+                print(train_mae)
                 print("Exit due to NaN")
                 break
 
             # val
             val_mae = self._validate(
-                val_loader, is_test=False, wandb_log_freq=wandb_log_freq
+                val_loader, is_test=False
             )
-            for key in self.targets:
+            for key in train_mae.keys():
                 self.training_history[key]["train"].append(train_mae[key])
                 self.training_history[key]["val"].append(val_mae[key])
 
             if "e" in val_mae and val_mae["e"] != val_mae["e"]:
+                print(val_mae)
                 print("Exit due to NaN")
                 break
 
             if save_dir:
                 self.save_checkpoint(epoch, val_mae, save_dir=save_dir)
 
-            # Log epoch metrics to wandb
-            if (
-                wandb is not None
-                and wandb_log_freq == LogEachEpoch
-                and self.trainer_args.get("wandb_path")
-            ):
-                wandb.log(
-                    {f"train_{k}_mae": v for k, v in train_mae.items()}
-                    | {f"val_{k}_mae": v for k, v in val_mae.items()}
-                    | {"epoch": epoch}
-                )
 
         if test_loader is not None:
             # test best model
@@ -348,7 +368,7 @@ class Trainer:
                 test_result_save_path=save_dir if save_test_result else None,
             )
 
-            for key in self.targets:
+            for key in train_mae.keys():
                 self.training_history[key]["test"] = test_mae[key]
             self.save(filename=os.path.join(save_dir, test_file))
 
@@ -396,13 +416,23 @@ class Trainer:
 
             # compute output
             prediction = self.model(graphs, task=self.targets)
-            combined_loss = self.criterion(targets, prediction)
+            if isinstance(self.criterion, ModifiedCombinedLoss):
+                combined_loss = self.criterion(targets, prediction, graphs)
+            else:
+                combined_loss = self.criterion(targets, prediction)
 
             losses.update(combined_loss["loss"].data.cpu().item(), len(graphs))
             for key in self.targets:
                 mae_errors[key].update(
                     combined_loss[f"{key}_MAE"].cpu().item(),
                     combined_loss[f"{key}_MAE_size"],
+                )
+                if key == "m" and f"m_sign_MAE" in combined_loss.keys():
+                    if "m_sign" not in mae_errors.keys():
+                        mae_errors["m_sign"] = AverageMeter()
+                    mae_errors["m_sign"].update(
+                    combined_loss[f"m_sign_MAE"].cpu().item(),
+                    combined_loss[f"m_sign_MAE_size"],
                 )
 
             # compute gradient and do SGD step
@@ -428,22 +458,11 @@ class Trainer:
                     f"Time ({batch_time.avg:.3f})({data_time.avg:.3f}) | "
                     f"Loss {losses.val:.4f}({losses.avg:.4f}) | MAE "
                 )
-                for key in self.targets:
+                for key in mae_errors.keys():
                     message += (
                         f"{key} {mae_errors[key].val:.3f}({mae_errors[key].avg:.3f})  "
                     )
                 print(message)
-
-            # Log train metrics to wandb after each batch if specified
-            if (
-                wandb is not None
-                and wandb_log_freq == "batch"
-                and self.trainer_args.get("wandb_path")
-            ):
-                wandb.log(
-                    {f"train_{k}_mae": v.avg for k, v in mae_errors.items()}
-                    | {"train_loss": losses.avg, "epoch": current_epoch, "batch": idx}
-                )
 
         return {key: round(err.avg, 6) for key, err in mae_errors.items()}
 
@@ -496,13 +515,23 @@ class Trainer:
 
             # compute output
             prediction = self.model(graphs, task=self.targets)
-            combined_loss = self.criterion(targets, prediction)
+            if isinstance(self.criterion, ModifiedCombinedLoss):
+                combined_loss = self.criterion(targets, prediction, graphs)
+            else:
+                combined_loss = self.criterion(targets, prediction)
 
             losses.update(combined_loss["loss"].data.cpu().item(), len(graphs))
             for key in self.targets:
                 mae_errors[key].update(
                     combined_loss[f"{key}_MAE"].cpu().item(),
                     combined_loss[f"{key}_MAE_size"],
+                )
+                if key == "m" and f"m_sign_MAE" in combined_loss.keys():
+                    if "m_sign" not in mae_errors.keys():
+                        mae_errors["m_sign"] = AverageMeter()
+                    mae_errors["m_sign"].update(
+                    combined_loss[f"m_sign_MAE"].cpu().item(),
+                    combined_loss[f"m_sign_MAE_size"],
                 )
             if is_test and test_result_save_path:
                 for jj, graph_i in enumerate(graphs):
@@ -550,23 +579,11 @@ class Trainer:
                     f"Time ({batch_time.avg:.3f}) | "
                     f"Loss {losses.val:.4f}({losses.avg:.4f}) | MAE "
                 )
-                for key in self.targets:
+                for key in mae_errors.keys():
                     message += (
                         f"{key} {mae_errors[key].val:.3f}({mae_errors[key].avg:.3f})  "
                     )
                 print(message)
-
-            # Log val metrics to wandb after each batch if specified
-            if (
-                wandb is not None
-                and not is_test
-                and wandb_log_freq == "batch"
-                and self.trainer_args.get("wandb_path")
-            ):
-                wandb.log(
-                    {f"val_{k}_mae": v.avg for k, v in mae_errors.items()}
-                    | {"val_loss": losses.avg, "batch": ii}
-                )
 
         if is_test:
             message = "**  "
@@ -576,18 +593,9 @@ class Trainer:
                 )
         else:
             message = "*   "
-        for key in self.targets:
+        for key in mae_errors.keys():
             message += f"{key}_MAE ({mae_errors[key].avg:.3f}) \t"
         print(message)
-
-        # Log val metrics to wandb at the end of epoch if specified
-        if (
-            wandb is not None
-            and not is_test
-            and wandb_log_freq == LogEachEpoch
-            and self.trainer_args.get("wandb_path")
-        ):
-            wandb.log({f"val_{k}_mae": v.avg for k, v in mae_errors.items()})
 
         return {k: round(mae_error.avg, 6) for k, mae_error in mae_errors.items()}
 
@@ -637,8 +645,8 @@ class Trainer:
                 os.remove(os.path.join(save_dir, fname))
 
         err_str = "_".join(
-            f"{key}{f'{mae_error[key] * 1000:.0f}' if key in mae_error else 'NA'}"
-            for key in "efsm"
+            f"{key}{mae_error[key] * 1000:.0f}"
+            for key in mae_error.keys()
         )
         filename = os.path.join(save_dir, f"epoch{epoch}_{err_str}.pth.tar")
         self.save(filename=filename)
@@ -663,6 +671,25 @@ class Trainer:
                 filename,
                 os.path.join(save_dir, f"bestF_epoch{epoch}_{err_str}.pth.tar"),
             )
+        for target in "efsm":
+            is_best_model = False
+            if target in self.targets and (target != "m" or not isinstance(self.criterion, ModifiedCombinedLoss)) and mae_error[target] == min(
+                self.training_history[target]["val"]
+            ):
+                is_best_model = True
+            elif target == "m" and isinstance(self.criterion, ModifiedCombinedLoss) and "m_sign" in mae_error and np.array(mae_error["m"]) + np.array(mae_error["m_sign"]) == min(
+                np.array(self.training_history["m"]["val"]) + np.array(self.training_history["m_sign"]["val"])
+            ):
+                is_best_model = True
+            
+            if is_best_model:
+                for fname in os.listdir(save_dir):
+                        if fname.startswith(f"best{target.upper()}"):
+                            os.remove(os.path.join(save_dir, fname))
+                shutil.copyfile(
+                    filename,
+                    os.path.join(save_dir, f"best{target.upper()}_epoch{epoch}_{err_str}.pth.tar"),
+                )
 
     @classmethod
     def load(cls, path: str) -> Self:
@@ -861,6 +888,511 @@ class CombinedLoss(nn.Module):
                     mag_targets, mag_preds
                 )
                 out["m_MAE"] = mae(mag_targets, mag_preds)
+                out["m_MAE_size"] = m_mae_size
+            else:
+                out["m_MAE"] = torch.zeros([1])
+                out["m_MAE_size"] = m_mae_size
+
+        return out
+
+
+class ModifiedCombinedLoss(CombinedLoss):
+    """A combined loss function of energy, force, stress and magmom."""
+
+    def __init__(
+        self,
+        *,
+        target_str: str = "ef",
+        criterion: str = "MSE",
+        sign_correlation_method: str = "subtract",
+        energy_loss_ratio: float = 1,
+        force_loss_ratio: float = 1,
+        stress_loss_ratio: float = 0.1,
+        mag_loss_ratio: float = 0.1,
+        delta: float = 0.1,
+        allow_missing_labels: bool = True,
+    ) -> None:
+        """Initialize the combined loss.
+
+        Args:
+            target_str: the training target label. Can be "e", "ef", "efs", "efsm" etc.
+                Default = "ef"
+            criterion: loss criterion to use
+                Default = "MSE"
+            energy_loss_ratio (float): energy loss ratio in loss function
+                Default = 1
+            force_loss_ratio (float): force loss ratio in loss function
+                Default = 1
+            stress_loss_ratio (float): stress loss ratio in loss function
+                Default = 0.1
+            mag_loss_ratio (float): magmom loss ratio in loss function
+                Default = 0.1
+            delta (float): delta for torch.nn.HuberLoss. Default = 0.1
+            allow_missing_labels (bool): whether to allow missing labels in the dataset,
+                missed target will not contribute to loss and MAEs
+        """
+        super().__init__()
+        # Define loss criterion
+        if criterion in {"MSE", "mse"}:
+            self.criterion = nn.MSELoss()
+        elif criterion in {"MAE", "mae", "l1"}:
+            self.criterion = nn.L1Loss()
+        elif criterion == "Huber":
+            self.criterion = nn.HuberLoss(delta=delta)
+        else:
+            raise NotImplementedError
+        self.target_str = target_str
+        self.energy_loss_ratio = energy_loss_ratio
+        if "f" not in self.target_str:
+            self.force_loss_ratio = 0
+        else:
+            self.force_loss_ratio = force_loss_ratio
+        if "s" not in self.target_str:
+            self.stress_loss_ratio = 0
+        else:
+            self.stress_loss_ratio = stress_loss_ratio
+        if "m" not in self.target_str:
+            self.mag_loss_ratio = 0
+        else:
+            self.mag_loss_ratio = mag_loss_ratio
+        self.allow_missing_labels = allow_missing_labels
+        if sign_correlation_method == "subtract":
+            self.correlation_method = lambda x1, x2: torch.abs(torch.subtract(x1, x2))
+        elif sign_correlation_method == "mul":
+            self.correlation_method = torch.mul
+        else:
+            raise ValueError(f"Unknown magmom correlation method {sign_correlation_method}")
+
+    def forward(
+        self,
+        targets: dict[str, Tensor],
+        prediction: dict[str, Tensor],
+        graphs: Sequence[CrystalGraph],
+    ) -> dict[str, Tensor]:
+        """Compute the combined loss using CHGNet prediction and labels
+        this function can automatically mask out magmom loss contribution of
+        data points without magmom labels.
+
+        Args:
+            targets (dict): DFT labels
+            prediction (dict): CHGNet prediction
+
+        Returns:
+            dictionary of all the loss, MAE and MAE_size
+        """
+        out = {"loss": 0.0}
+        # Energy
+        if "e" in self.target_str:
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(targets["e"])
+                valid_e_target = targets["e"][valid_value_indices]
+                valid_e_pred = prediction["e"][valid_value_indices]
+                if valid_e_pred.shape == torch.Size([]):
+                    valid_e_pred = valid_e_pred.view(1)
+            else:
+                valid_e_target = targets["e"]
+                valid_e_pred = prediction["e"]
+
+            out["loss"] += self.energy_loss_ratio * self.criterion(
+                valid_e_target, valid_e_pred
+            )
+            out["e_MAE"] = mae(valid_e_target, valid_e_pred)
+            out["e_MAE_size"] = prediction["e"].shape[0]
+
+        # Force
+        if "f" in self.target_str:
+            forces_pred = torch.cat(prediction["f"], dim=0)
+            forces_target = torch.cat(targets["f"], dim=0)
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(forces_target)
+                forces_target = forces_target[valid_value_indices]
+                forces_pred = forces_pred[valid_value_indices]
+            out["loss"] += self.force_loss_ratio * self.criterion(
+                forces_target, forces_pred
+            )
+            out["f_MAE"] = mae(forces_target, forces_pred)
+            out["f_MAE_size"] = forces_target.shape[0]
+
+        # Stress
+        if "s" in self.target_str:
+            stress_pred = torch.cat(prediction["s"], dim=0)
+            stress_target = torch.cat(targets["s"], dim=0)
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(stress_target)
+                stress_target = stress_target[valid_value_indices]
+                stress_pred = stress_pred[valid_value_indices]
+            out["loss"] += self.stress_loss_ratio * self.criterion(
+                stress_target, stress_pred
+            )
+            out["s_MAE"] = mae(stress_target, stress_pred)
+            out["s_MAE_size"] = stress_target.shape[0]
+
+        # Mag
+        if "m" in self.target_str:
+            mag_preds, mag_targets = [], []
+            m_mae_size = 0
+            mag_sign_preds, mag_sign_targets = [], []
+            m_sign_mae_size = 0
+            for mag_pred, mag_target, graph in zip(prediction["m"], targets["m"], graphs, strict=True):
+                # exclude structures without magmom labels
+                if self.allow_missing_labels:
+                    if mag_target is not None and not torch.isnan(mag_target).any():
+                        mag_preds.append(mag_pred)
+                        mag_targets.append(mag_target)
+                        m_mae_size += mag_target.shape[0]
+                        mag_sign_preds.append(self.correlation_method(mag_pred[graph.atom_graph[:,0]], mag_pred[graph.atom_graph[:,1]]))
+                        mag_sign_targets.append(self.correlation_method(mag_target[graph.atom_graph[:,0]], mag_target[graph.atom_graph[:,1]]))
+                        m_sign_mae_size += graph.atom_graph.shape[0]
+                else:
+                    mag_preds.append(mag_pred)
+                    mag_targets.append(mag_target)
+                    m_mae_size += mag_target.shape[0]
+                    mag_sign_preds.append(self.correlation_method(mag_pred[graph.atom_graph[:,0]], mag_pred[graph.atom_graph[:,1]]))
+                    mag_sign_targets.append(self.correlation_method(mag_target[graph.atom_graph[:,0]], mag_target[graph.atom_graph[:,1]]))
+                    m_sign_mae_size += graph.atom_graph.shape[0]
+            if mag_targets != []:
+                mag_preds = torch.cat(mag_preds, dim=0)
+                mag_sign_preds = torch.cat(mag_sign_preds, dim=0)
+                mag_targets = torch.cat(mag_targets, dim=0)
+                mag_sign_targets = torch.cat(mag_sign_targets, dim=0)
+                out["loss"] += self.mag_loss_ratio * self.criterion(
+                    torch.abs(mag_targets), torch.abs(mag_preds)
+                )
+                out["loss"] += self.mag_loss_ratio * self.criterion(
+                    mag_sign_targets, mag_sign_preds
+                )
+                
+                out["m_MAE"] = mae(mag_targets, mag_preds)
+                out["m_MAE_size"] = m_mae_size
+                out["m_sign_MAE"] = mae(mag_sign_targets, mag_sign_preds)
+                out["m_sign_MAE_size"] = m_sign_mae_size
+            else:
+                
+                out["m_MAE"] = torch.zeros([1])
+                out["m_MAE_size"] = m_mae_size
+                out["m_sign_MAE"] = torch.zeros([1])
+                out["m_sign_MAE_size"] = m_sign_mae_size
+
+        return out
+    
+
+
+class ModifiedCombinedCorrelationLoss(ModifiedCombinedLoss):
+    """A combined loss function of energy, force, stress and magmom."""
+
+    def __init__(
+        self,
+        *,
+        target_str: str = "ef",
+        criterion: str = "MSE",
+        sign_correlation_method: str = "subtract",
+        energy_loss_ratio: float = 1,
+        force_loss_ratio: float = 1,
+        stress_loss_ratio: float = 0.1,
+        mag_loss_ratio: float = 0.1,
+        delta: float = 0.1,
+        allow_missing_labels: bool = True,
+    ) -> None:
+        """Initialize the combined loss.
+
+        Args:
+            target_str: the training target label. Can be "e", "ef", "efs", "efsm" etc.
+                Default = "ef"
+            criterion: loss criterion to use
+                Default = "MSE"
+            energy_loss_ratio (float): energy loss ratio in loss function
+                Default = 1
+            force_loss_ratio (float): force loss ratio in loss function
+                Default = 1
+            stress_loss_ratio (float): stress loss ratio in loss function
+                Default = 0.1
+            mag_loss_ratio (float): magmom loss ratio in loss function
+                Default = 0.1
+            delta (float): delta for torch.nn.HuberLoss. Default = 0.1
+            allow_missing_labels (bool): whether to allow missing labels in the dataset,
+                missed target will not contribute to loss and MAEs
+        """
+        super().__init__()
+        # Define loss criterion
+        if criterion in {"MSE", "mse"}:
+            self.criterion = nn.MSELoss()
+        elif criterion in {"MAE", "mae", "l1"}:
+            self.criterion = nn.L1Loss()
+        elif criterion == "Huber":
+            self.criterion = nn.HuberLoss(delta=delta)
+        else:
+            raise NotImplementedError
+        self.target_str = target_str
+        self.energy_loss_ratio = energy_loss_ratio
+        if "f" not in self.target_str:
+            self.force_loss_ratio = 0
+        else:
+            self.force_loss_ratio = force_loss_ratio
+        if "s" not in self.target_str:
+            self.stress_loss_ratio = 0
+        else:
+            self.stress_loss_ratio = stress_loss_ratio
+        if "m" not in self.target_str:
+            self.mag_loss_ratio = 0
+        else:
+            self.mag_loss_ratio = mag_loss_ratio
+        self.allow_missing_labels = allow_missing_labels
+        if sign_correlation_method == "subtract":
+            self.correlation_method = lambda x1, x2: torch.abs(torch.subtract(x1, x2))
+        elif sign_correlation_method == "mul":
+            self.correlation_method = torch.mul
+        else:
+            raise ValueError(f"Unknown magmom correlation method {sign_correlation_method}")
+
+    def forward(
+        self,
+        targets: dict[str, Tensor],
+        prediction: dict[str, Tensor],
+        graphs: Sequence[CrystalGraph],
+    ) -> dict[str, Tensor]:
+        """Compute the combined loss using CHGNet prediction and labels
+        this function can automatically mask out magmom loss contribution of
+        data points without magmom labels.
+
+        Args:
+            targets (dict): DFT labels
+            prediction (dict): CHGNet prediction
+
+        Returns:
+            dictionary of all the loss, MAE and MAE_size
+        """
+        out = {"loss": 0.0}
+        # Energy
+        if "e" in self.target_str:
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(targets["e"])
+                valid_e_target = targets["e"][valid_value_indices]
+                valid_e_pred = prediction["e"][valid_value_indices]
+                if valid_e_pred.shape == torch.Size([]):
+                    valid_e_pred = valid_e_pred.view(1)
+            else:
+                valid_e_target = targets["e"]
+                valid_e_pred = prediction["e"]
+
+            out["loss"] += self.energy_loss_ratio * self.criterion(
+                valid_e_target, valid_e_pred
+            )
+            out["e_MAE"] = mae(valid_e_target, valid_e_pred)
+            out["e_MAE_size"] = prediction["e"].shape[0]
+
+        # Force
+        if "f" in self.target_str:
+            forces_pred = torch.cat(prediction["f"], dim=0)
+            forces_target = torch.cat(targets["f"], dim=0)
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(forces_target)
+                forces_target = forces_target[valid_value_indices]
+                forces_pred = forces_pred[valid_value_indices]
+            out["loss"] += self.force_loss_ratio * self.criterion(
+                forces_target, forces_pred
+            )
+            out["f_MAE"] = mae(forces_target, forces_pred)
+            out["f_MAE_size"] = forces_target.shape[0]
+
+        # Stress
+        if "s" in self.target_str:
+            stress_pred = torch.cat(prediction["s"], dim=0)
+            stress_target = torch.cat(targets["s"], dim=0)
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(stress_target)
+                stress_target = stress_target[valid_value_indices]
+                stress_pred = stress_pred[valid_value_indices]
+            out["loss"] += self.stress_loss_ratio * self.criterion(
+                stress_target, stress_pred
+            )
+            out["s_MAE"] = mae(stress_target, stress_pred)
+            out["s_MAE_size"] = stress_target.shape[0]
+
+        # Mag
+        if "m" in self.target_str:
+            mag_corr_preds, mag_corr_targets = [], []
+            m_corr_mae_size = 0
+            for mag_pred, mag_target, graph in zip(prediction["m"], targets["m"], graphs, strict=True):
+                # exclude structures without magmom labels
+                if self.allow_missing_labels:
+                    if mag_target is not None and not torch.isnan(mag_target).any():
+                        mag_corr_preds.append(self.correlation_method(mag_pred[graph.atom_graph[:,0]], mag_pred[graph.atom_graph[:,1]]))
+                        mag_corr_targets.append(self.correlation_method(mag_target[graph.atom_graph[:,0]], mag_target[graph.atom_graph[:,1]]))
+                        m_corr_mae_size += graph.atom_graph.shape[0]
+                else:
+                    mag_corr_preds.append(self.correlation_method(mag_pred[graph.atom_graph[:,0]], mag_pred[graph.atom_graph[:,1]]))
+                    mag_corr_targets.append(self.correlation_method(mag_target[graph.atom_graph[:,0]], mag_target[graph.atom_graph[:,1]]))
+                    m_corr_mae_size += graph.atom_graph.shape[0]
+            if mag_corr_targets != []:
+                mag_corr_preds = torch.cat(mag_corr_preds, dim=0)
+                mag_corr_targets = torch.cat(mag_corr_targets, dim=0)
+                out["loss"] += self.mag_loss_ratio * self.criterion(
+                    mag_corr_targets, mag_corr_preds
+                )
+                out["m_MAE"] = mae(mag_corr_targets, mag_corr_preds)
+                out["m_MAE_size"] = m_corr_mae_size
+            else:
+                out["m_MAE"] = torch.zeros([1])
+                out["m_MAE_size"] = m_corr_mae_size
+
+        return out
+
+
+class MinCombinedLoss(nn.Module):
+    """A combined loss function of energy, force, stress and magmom."""
+
+    def __init__(
+        self,
+        *,
+        target_str: str = "ef",
+        criterion: str = "MSE",
+        energy_loss_ratio: float = 1,
+        force_loss_ratio: float = 1,
+        stress_loss_ratio: float = 0.1,
+        mag_loss_ratio: float = 0.1,
+        delta: float = 0.1,
+        allow_missing_labels: bool = True,
+    ) -> None:
+        """Initialize the combined loss.
+
+        Args:
+            target_str: the training target label. Can be "e", "ef", "efs", "efsm" etc.
+                Default = "ef"
+            criterion: loss criterion to use
+                Default = "MSE"
+            energy_loss_ratio (float): energy loss ratio in loss function
+                Default = 1
+            force_loss_ratio (float): force loss ratio in loss function
+                Default = 1
+            stress_loss_ratio (float): stress loss ratio in loss function
+                Default = 0.1
+            mag_loss_ratio (float): magmom loss ratio in loss function
+                Default = 0.1
+            delta (float): delta for torch.nn.HuberLoss. Default = 0.1
+            allow_missing_labels (bool): whether to allow missing labels in the dataset,
+                missed target will not contribute to loss and MAEs
+        """
+        super().__init__()
+        # Define loss criterion
+        if criterion in {"MSE", "mse"}:
+            self.criterion = nn.MSELoss()
+        elif criterion in {"MAE", "mae", "l1"}:
+            self.criterion = nn.L1Loss()
+        elif criterion == "Huber":
+            self.criterion = nn.HuberLoss(delta=delta)
+        else:
+            raise NotImplementedError
+        self.target_str = target_str
+        self.energy_loss_ratio = energy_loss_ratio
+        if "f" not in self.target_str:
+            self.force_loss_ratio = 0
+        else:
+            self.force_loss_ratio = force_loss_ratio
+        if "s" not in self.target_str:
+            self.stress_loss_ratio = 0
+        else:
+            self.stress_loss_ratio = stress_loss_ratio
+        if "m" not in self.target_str:
+            self.mag_loss_ratio = 0
+        else:
+            self.mag_loss_ratio = mag_loss_ratio
+        self.allow_missing_labels = allow_missing_labels
+
+    def forward(
+        self,
+        targets: dict[str, Tensor],
+        prediction: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        """Compute the combined loss using CHGNet prediction and labels
+        this function can automatically mask out magmom loss contribution of
+        data points without magmom labels.
+
+        Args:
+            targets (dict): DFT labels
+            prediction (dict): CHGNet prediction
+
+        Returns:
+            dictionary of all the loss, MAE and MAE_size
+        """
+        out = {"loss": 0.0}
+        # Energy
+        if "e" in self.target_str:
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(targets["e"])
+                valid_e_target = targets["e"][valid_value_indices]
+                valid_e_pred = prediction["e"][valid_value_indices]
+                if valid_e_pred.shape == torch.Size([]):
+                    valid_e_pred = valid_e_pred.view(1)
+            else:
+                valid_e_target = targets["e"]
+                valid_e_pred = prediction["e"]
+
+            out["loss"] += self.energy_loss_ratio * self.criterion(
+                valid_e_target, valid_e_pred
+            )
+            out["e_MAE"] = mae(valid_e_target, valid_e_pred)
+            out["e_MAE_size"] = prediction["e"].shape[0]
+
+        # Force
+        if "f" in self.target_str:
+            forces_pred = torch.cat(prediction["f"], dim=0)
+            forces_target = torch.cat(targets["f"], dim=0)
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(forces_target)
+                forces_target = forces_target[valid_value_indices]
+                forces_pred = forces_pred[valid_value_indices]
+            out["loss"] += self.force_loss_ratio * self.criterion(
+                forces_target, forces_pred
+            )
+            out["f_MAE"] = mae(forces_target, forces_pred)
+            out["f_MAE_size"] = forces_target.shape[0]
+
+        # Stress
+        if "s" in self.target_str:
+            stress_pred = torch.cat(prediction["s"], dim=0)
+            stress_target = torch.cat(targets["s"], dim=0)
+            if self.allow_missing_labels:
+                valid_value_indices = ~torch.isnan(stress_target)
+                stress_target = stress_target[valid_value_indices]
+                stress_pred = stress_pred[valid_value_indices]
+            out["loss"] += self.stress_loss_ratio * self.criterion(
+                stress_target, stress_pred
+            )
+            out["s_MAE"] = mae(stress_target, stress_pred)
+            out["s_MAE_size"] = stress_target.shape[0]
+
+        # Mag
+        if "m" in self.target_str:
+            mag_preds, mag_targets = [], []
+            mag_signs = []
+            m_mae_size = 0
+            for mag_pred, mag_target in zip(prediction["m"], targets["m"], strict=True):
+                # exclude structures without magmom labels
+                if self.allow_missing_labels:
+                    if mag_target is not None and not torch.isnan(mag_target).any():
+                        mag_preds.append(mag_pred)
+                        mag_targets.append(mag_target)
+                        with torch.no_grad():
+                            mag_signs.append(
+                                torch.ones_like(mag_target) * (np.argmin([self.criterion(-mag_pred, mag_target).cpu(), self.criterion(mag_pred, mag_target).cpu()]) - 0.5) * 2
+                            ) # 0,1 -> -1, 1
+                        m_mae_size += mag_target.shape[0]
+                else:
+                    mag_preds.append(mag_pred)
+                    mag_targets.append(mag_target)
+                    with torch.no_grad():
+                        mag_signs.append(
+                                torch.ones_like(mag_target) * (np.argmin([self.criterion(-mag_pred, mag_target).cpu(), self.criterion(mag_pred, mag_target).cpu()]) - 0.5) * 2
+                            ) # 0,1 -> -1, 1
+                    m_mae_size += mag_target.shape[0]
+            if mag_targets != []:
+                mag_preds = torch.cat(mag_preds, dim=0)
+                mag_targets = torch.cat(mag_targets, dim=0)
+                mag_signs = torch.cat(mag_signs, dim=0)
+                out["loss"] += self.mag_loss_ratio * self.criterion(
+                    mag_targets, mag_preds * mag_signs
+                )
+                out["m_MAE"] = mae(mag_targets, mag_preds * torch.Tensor(mag_signs))
                 out["m_MAE_size"] = m_mae_size
             else:
                 out["m_MAE"] = torch.zeros([1])

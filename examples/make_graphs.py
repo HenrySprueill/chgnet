@@ -4,6 +4,8 @@ import os
 import random
 
 import torch
+
+import numpy as np
 from pymatgen.core.structure import Structure
 
 from chgnet import utils
@@ -24,6 +26,7 @@ def make_graphs(
     graph_dir: str,
     train_ratio: float = 0.8,
     val_ratio: float = 0.1,
+    keys_to_skip:list | np.ndarray=[],
 ) -> None:
     """Make graphs from a StructureJsonData dataset.
 
@@ -41,16 +44,17 @@ def make_graphs(
     print(f"{len(data.keys)} graphs to make")
 
     for idx, (mp_id, graph_id) in enumerate(data.keys):
-        dic = make_one_graph(mp_id, graph_id, data, graph_dir)
-        if dic is not False:  # graph made successfully
-            if mp_id not in labels:
-                labels[mp_id] = {graph_id: dic}
+        if idx not in keys_to_skip:
+            dic = make_one_graph(mp_id, graph_id, data, graph_dir)
+            if dic is not False:  # graph made successfully
+                if mp_id not in labels:
+                    labels[mp_id] = {graph_id: dic}
+                else:
+                    labels[mp_id][graph_id] = dic
             else:
-                labels[mp_id][graph_id] = dic
-        else:
-            failed_graphs += [(mp_id, graph_id)]
-        if idx % 1000 == 0:
-            print(idx)
+                failed_graphs += [(mp_id, graph_id)]
+            if idx % 1000 == 0:
+                print(idx)
 
     utils.write_json(labels, os.path.join(graph_dir, "labels.json"))
     utils.write_json(failed_graphs, os.path.join(graph_dir, "failed_graphs.json"))
@@ -109,9 +113,10 @@ def make_partition(
 
 
 if __name__ == "__main__":
-    data_path = ""
-    graph_dir = ""
+    data_path = "mptraj_antiferromagnetic.json"
+    graph_dir = "mptraj_antiferromagnetic_filtered_graphs"
+    keys_to_skip = np.load("skip_keys.npz")["skip"]
 
     converter = CrystalGraphConverter(atom_graph_cutoff=5, bond_graph_cutoff=3)
-    data = StructureJsonData(data_path, graph_converter=converter)
-    make_graphs(data, graph_dir)
+    data = StructureJsonData(data_path, graph_converter=converter, absolute_magmom=False)
+    make_graphs(data, graph_dir, keys_to_skip=keys_to_skip)
